@@ -3,6 +3,7 @@
 
 using System;
 using System.Buffers;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Text;
@@ -341,6 +342,7 @@ internal partial class DefaultHybridCache
                     if (_factoryWithOptions is not null && _options!.Revision != _factoryOptionsRevision)
                     {
                         ApplyFactoryOptions(_options, mandatoryWriteSideFlags, ref activeFlags);
+                        ApplyFactoryTags(_options, ref activeFlags);
                     }
 
                     // check whether we're going to hit a timing problem with tag invalidation
@@ -641,6 +643,70 @@ internal partial class DefaultHybridCache
 
             HybridCacheEntryFlags factoryFlags = factoryOptions.Flags ?? HybridCacheEntryFlags.None;
             activeFlags = (activeFlags & ~WriteSideFlags) | (factoryFlags & WriteSideFlags) | mandatoryWriteSideFlags;
+        }
+
+        /// <summary>
+        /// Applies any tags the factory set on the options it received. The resulting cache entry is
+        /// associated with the union of the caller-supplied tags (already captured on <see cref="CacheItem"/>)
+        /// and the factory-supplied tags. Because these tags are only known after the factory ran, they are
+        /// validated and prefetched here rather than at the top of <see cref="BackgroundFetchAsync"/>.
+        /// </summary>
+        private void ApplyFactoryTags(HybridCacheEntryOptions factoryOptions, ref HybridCacheEntryFlags activeFlags)
+        {
+            IEnumerable<string>? factoryTags = factoryOptions.Tags;
+            if (factoryTags is null)
+            {
+                return;
+            }
+
+            TagSet callerTags = CacheItem.Tags;
+            if (!TryCombineTags(callerTags, factoryTags, out TagSet combined))
+            {
+                // factory tags were all duplicates (or empty); nothing new to persist
+                return;
+            }
+
+            CacheItem.UnsafeSetTags(combined);
+
+            // the newly added tags were not unicode-validated before the factory ran; validate now, and
+            // if invalid, suppress the L2 write (the reads already happened, so only the write is affected)
+            if ((activeFlags & HybridCacheEntryFlags.DisableDistributedCache) != HybridCacheEntryFlags.DisableDistributedCache
+                && !ValidateUnicodeCorrectness(Cache._logger, Key.Key, combined))
+            {
+                activeFlags |= HybridCacheEntryFlags.DisableDistributedCacheWrite;
+            }
+
+            // kick off invalidation-time fetches for the new tags so the imminent IsValid check is meaningful
+            Cache.PrefetchTags(combined);
+        }
+
+        private static bool TryCombineTags(TagSet callerTags, IEnumerable<string> factoryTags, out TagSet combined)
+        {
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var list = new List<string>();
+
+            for (int i = 0; i < callerTags.Count; i++)
+            {
+                string tag = callerTags[i];
+                if (seen.Add(tag))
+                {
+                    list.Add(tag);
+                }
+            }
+
+            // union semantics: the factory can only add tags, so this is the only place new tags appear
+            bool addedNew = false;
+            foreach (string tag in factoryTags)
+            {
+                if (seen.Add(tag))
+                {
+                    list.Add(tag);
+                    addedNew = true;
+                }
+            }
+
+            combined = addedNew ? TagSet.Create(list) : default;
+            return addedNew;
         }
     }
 

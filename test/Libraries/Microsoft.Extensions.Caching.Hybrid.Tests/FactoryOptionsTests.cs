@@ -360,6 +360,120 @@ public class FactoryOptionsTests(ITestOutputHelper log) : IClassFixture<TestEven
         Assert.Equal(opsAfterFirst, loggingB.OpCount);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FactoryComputedTags_DriveTagInvalidation(bool withL2)
+    {
+        // The factory associates a tag with the entry based on the value it produced; invalidating
+        // that computed tag must force a re-fetch, proving the factory-set tag reached the cache.
+        IDistributedCache? l2 = withL2
+            ? new LoggingCache(log, new MemoryDistributedCache(Options.Create(new MemoryDistributedCacheOptions())))
+            : null;
+
+        using var provider = GetDefaultCache(out var cache, services =>
+        {
+            if (l2 is not null)
+            {
+                services.AddSingleton(l2);
+            }
+        });
+
+        string key = nameof(FactoryComputedTags_DriveTagInvalidation);
+        int factoryCalls = 0;
+
+        ValueTask<Guid> Factory(HybridCacheEntryOptions options, CancellationToken _)
+        {
+            Interlocked.Increment(ref factoryCalls);
+            options.Tags = ["computed-tag"];
+            return new ValueTask<Guid>(Guid.NewGuid());
+        }
+
+        var value = await cache.GetOrCreateAsync(key, Factory);
+        Assert.Equal(1, factoryCalls);
+
+        // repeat: served from cache, factory not called again
+        Assert.Equal(value, await cache.GetOrCreateAsync(key, Factory));
+        Assert.Equal(1, factoryCalls);
+
+        // invalidating an unrelated tag has no effect
+        await cache.RemoveByTagAsync("unrelated");
+        Assert.Equal(value, await cache.GetOrCreateAsync(key, Factory));
+        Assert.Equal(1, factoryCalls);
+
+        // invalidating the factory-computed tag forces a re-fetch
+        await cache.RemoveByTagAsync("computed-tag");
+        var newValue = await cache.GetOrCreateAsync(key, Factory);
+        Assert.NotEqual(value, newValue);
+        Assert.Equal(2, factoryCalls);
+    }
+
+    [Fact]
+    public async Task FactoryComputedTags_AreUnionedWithCallerTags()
+    {
+        // Caller supplies one tag up front; the factory computes another. The entry must be
+        // associated with both, so invalidating either the caller tag or the factory tag re-fetches.
+        static async Task AssertInvalidatedByAsync(string invalidateTag)
+        {
+            var services = new ServiceCollection();
+            services.AddHybridCache();
+            using var provider = services.BuildServiceProvider();
+            var cache = provider.GetRequiredService<HybridCache>();
+
+            string key = "union-key";
+            int factoryCalls = 0;
+
+            ValueTask<Guid> Factory(HybridCacheEntryOptions options, CancellationToken _)
+            {
+                Interlocked.Increment(ref factoryCalls);
+                options.Tags = ["factory-tag"];
+                return new ValueTask<Guid>(Guid.NewGuid());
+            }
+
+            var value = await cache.GetOrCreateAsync(key, Factory, tags: ["caller-tag"]);
+            Assert.Equal(1, factoryCalls);
+
+            await cache.RemoveByTagAsync(invalidateTag);
+
+            var newValue = await cache.GetOrCreateAsync(key, Factory, tags: ["caller-tag"]);
+            Assert.NotEqual(value, newValue);
+            Assert.Equal(2, factoryCalls);
+        }
+
+        await AssertInvalidatedByAsync("caller-tag");
+        await AssertInvalidatedByAsync("factory-tag");
+    }
+
+    [Fact]
+    public async Task FactoryComputedTags_AreApplied_EvenWhenCallerSuppliedDuplicateTags()
+    {
+        // Guards against a count-based short-circuit: caller passes duplicate tags so the raw caller
+        // tag count equals the deduplicated union count, yet the factory did contribute a new tag.
+        var services = new ServiceCollection();
+        services.AddHybridCache();
+        using var provider = services.BuildServiceProvider();
+        var cache = provider.GetRequiredService<HybridCache>();
+
+        string key = nameof(FactoryComputedTags_AreApplied_EvenWhenCallerSuppliedDuplicateTags);
+        int factoryCalls = 0;
+
+        ValueTask<Guid> Factory(HybridCacheEntryOptions options, CancellationToken _)
+        {
+            Interlocked.Increment(ref factoryCalls);
+            options.Tags = ["factory-tag"];
+            return new ValueTask<Guid>(Guid.NewGuid());
+        }
+
+        var value = await cache.GetOrCreateAsync(key, Factory, tags: ["dup", "dup"]);
+        Assert.Equal(1, factoryCalls);
+
+        await cache.RemoveByTagAsync("factory-tag");
+
+        var newValue = await cache.GetOrCreateAsync(key, Factory, tags: ["dup", "dup"]);
+        Assert.NotEqual(value, newValue);
+        Assert.Equal(2, factoryCalls);
+    }
+
     // Test-only IDistributedCache that wraps another IDistributedCache and adds:
     //   - LastSetOptions: the DistributedCacheEntryOptions from the most recent Set/SetAsync,
     //     for tests that assert on the options the HybridCache layer produced.
@@ -472,6 +586,11 @@ public class FactoryOptionsTests(ITestOutputHelper log) : IClassFixture<TestEven
             var nonDefault = Enum.GetValues(underlying).Cast<object>()
                 .FirstOrDefault(v => !v.Equals(Activator.CreateInstance(underlying)));
             return nonDefault ?? Activator.CreateInstance(underlying)!;
+        }
+
+        if (underlying == typeof(IEnumerable<string>))
+        {
+            return new[] { "tag-" + (StableHash(propName) % 1000) };
         }
 
         throw new NotSupportedException(

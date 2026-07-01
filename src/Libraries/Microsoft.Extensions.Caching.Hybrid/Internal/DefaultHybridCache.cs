@@ -312,6 +312,7 @@ internal sealed partial class DefaultHybridCache : HybridCache
             LocalCacheExpiration = options.LocalCacheExpiration,
             Flags = options.Flags,
             LocalSize = options.LocalSize,
+            Tags = options.Tags,
         };
 #endif
     }

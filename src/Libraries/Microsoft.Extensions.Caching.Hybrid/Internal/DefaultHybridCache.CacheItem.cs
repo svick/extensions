@@ -28,7 +28,7 @@ internal partial class DefaultHybridCache
 
         public long CreationTimestamp => _creationTimestamp;
 
-        public TagSet Tags { get; }
+        public TagSet Tags { get; private set; }
 
         // Note: the ref count is the number of callers anticipating this value at any given time. Initially,
         // it is one for a simple "get the value" flow, but if another call joins with us, it'll be incremented.
@@ -42,6 +42,10 @@ internal partial class DefaultHybridCache
 
         internal void UnsafeSetCreationTimestamp(long timestamp)
             => Unsafe.AsRef(in _creationTimestamp) = timestamp;
+
+        // Called once, before the item is published to L1/L2, when a factory computed additional tags.
+        // Safe because at that point only the owning execution has a reference to this item.
+        internal void UnsafeSetTags(TagSet tags) => Tags = tags;
 
         internal static readonly PostEvictionDelegate SharedOnEviction = static (key, value, reason, state) =>
         {
